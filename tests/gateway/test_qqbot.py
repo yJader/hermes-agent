@@ -397,6 +397,133 @@ class TestBuildTextBody:
         assert body["msg_type"] == 2  # MSG_TYPE_MARKDOWN
         assert body["markdown"]["content"] == "**bold** text"
 
+    @pytest.mark.parametrize("markdown_support", [False, True])
+    def test_reply_reference_is_present_for_all_text_formats(self, markdown_support):
+        adapter = self._make_adapter(
+            app_id="a", client_secret="b", markdown_support=markdown_support)
+        body = adapter._build_text_body("reply", reply_to="inbound-1")
+        assert body["message_reference"] == {"message_id": "inbound-1"}
+
+
+class TestReplyAnchoring:
+    def _make_adapter(self):
+        from gateway.platforms.qqbot import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b"))
+
+    @pytest.mark.asyncio
+    async def test_send_never_guesses_from_last_message_in_chat(self):
+        adapter = self._make_adapter()
+        adapter._last_msg_id["group-1"] = "other-users-message"
+        adapter._ensure_connected = mock.AsyncMock(return_value=True)
+        adapter._send_chunk = mock.AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="out-1"))
+
+        await adapter.send("group-1", "proactive message")
+
+        adapter._send_chunk.assert_awaited_once_with("group-1", "proactive message", None)
+
+    @pytest.mark.asyncio
+    async def test_every_text_chunk_keeps_current_reply_anchor(self):
+        adapter = self._make_adapter()
+        adapter._ensure_connected = mock.AsyncMock(return_value=True)
+        adapter.truncate_message = mock.Mock(return_value=["part 1", "part 2"])
+        adapter._send_chunk = mock.AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="out-1"))
+
+        await adapter.send(
+            "group-1", "long response",
+            metadata={"reply_to_message_id": "current-message"})
+
+        assert adapter._send_chunk.await_args_list == [
+            mock.call("group-1", "part 1", "current-message"),
+            mock.call("group-1", "part 2", "current-message"),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("method", "source_kw"),
+        [
+            ("send_image_file", {"image_path": "/tmp/image.png"}),
+            ("send_voice", {"audio_path": "/tmp/voice.mp3"}),
+            ("send_video", {"video_path": "/tmp/video.mp4"}),
+            ("send_document", {"file_path": "/tmp/file.txt"}),
+        ],
+    )
+    async def test_local_media_uses_current_reply_anchor(self, method, source_kw):
+        adapter = self._make_adapter()
+        adapter._send_media = mock.AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="out-1"))
+
+        await getattr(adapter, method)(
+            "group-1", **source_kw,
+            metadata={"reply_to_message_id": "current-message"})
+
+        assert adapter._send_media.await_args.args[5] == "current-message"
+
+    @pytest.mark.asyncio
+    async def test_expired_reply_is_not_retried(self):
+        adapter = self._make_adapter()
+        adapter._chat_type_map["group-1"] = "group"
+        adapter._send_group_text = mock.AsyncMock(
+            side_effect=RuntimeError("QQ Bot API error [400]: 回复消息msg_id已过期"))
+
+        result = await adapter._send_chunk(
+            "group-1", "reply", reply_to="expired-message")
+
+        assert adapter._send_group_text.await_count == 1
+        assert result.retryable is False
+
+    def test_qq_turn_metadata_carries_exact_reply_anchor(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import _thread_metadata_for_source
+
+        source = SimpleNamespace(
+            platform=Platform.QQBOT, thread_id=None, profile=None)
+        assert _thread_metadata_for_source(source, "current-message") == {
+            "reply_to_message_id": "current-message"
+        }
+
+    def test_gateway_runner_carries_anchor_without_thread_id(self):
+        from gateway.config import Platform
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        assert runner._thread_metadata_for_target(
+            Platform.QQBOT, "group-1", None,
+            reply_to_message_id="current-message",
+        ) == {"reply_to_message_id": "current-message"}
+
+    @pytest.mark.asyncio
+    async def test_text_wire_payload_contains_passive_and_visible_reply_fields(self):
+        adapter = self._make_adapter()
+        adapter._post_message = mock.AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="out-1"))
+
+        await adapter._send_group_text(
+            "group-1", "reply", reply_to="current-message")
+
+        body = adapter._post_message.await_args.args[1]
+        assert body["msg_id"] == "current-message"
+        assert body["message_reference"] == {"message_id": "current-message"}
+
+    @pytest.mark.asyncio
+    async def test_media_wire_payload_contains_passive_and_visible_reply_fields(self):
+        adapter = self._make_adapter()
+        adapter._ensure_connected = mock.AsyncMock(return_value=True)
+        adapter._chat_type_map["group-1"] = "group"
+        adapter._upload_media = mock.AsyncMock(
+            return_value={"file_info": "uploaded-file"})
+        adapter._post_message = mock.AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="out-1"))
+
+        await adapter.send_image(
+            "group-1", "https://example.com/image.png",
+            metadata={"reply_to_message_id": "current-message"})
+
+        body = adapter._post_message.await_args.args[1]
+        assert body["msg_id"] == "current-message"
+        assert body["message_reference"] == {"message_id": "current-message"}
+
 
 # ---------------------------------------------------------------------------
 # _wait_for_reconnection / send reconnection wait
@@ -1270,4 +1397,3 @@ class TestReadEventsClosedWsGuard:
         adapter._ws = SimpleNamespace(closed=True)
         with pytest.raises(RuntimeError):
             asyncio.run(adapter._read_events())
-
